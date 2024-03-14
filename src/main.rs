@@ -6,7 +6,6 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::Path;
 use std::process::ExitCode;
 use std::str::FromStr;
@@ -144,15 +143,17 @@ fn run_machete() -> anyhow::Result<bool> {
             eprintln!("    ⚠️  {dep} was marked as ignored, but is actually used!");
         }
         if args.fix {
-            // todo: fix also ignored_used
-            let fixed = remove_dependencies(&fs::read_to_string(path)?, &deps.unused)?;
+            let fixed =
+                remove_dependencies(&fs::read_to_string(path)?, &deps.unused, &deps.ignored_used)?;
             fs::write(path, fixed).expect("Cargo.toml write error");
             // Save new checksum after fix and clear unused deps
             let new_checksum = checksum(path);
             cargo_dep.checksum = new_checksum;
             deps.unused = Vec::new();
-            // after fix actually there would be no unused dependencies
+            deps.ignored_used = Vec::new();
+            // after fix actually there would be no unused dependencies or ignored_used
             has_unused_dependencies = false;
+            has_ignored_used = false;
         }
     }
 
@@ -180,7 +181,13 @@ fn run_machete() -> anyhow::Result<bool> {
     }
 
     if !(has_unused_dependencies || has_ignored_used) {
-        println!("cargo-machete-nk didn't find any unused or ignored used dependencies. Good job!",);
+        if args.fix {
+            println!("All unused/ignored_used dependencies has been fixed!")
+        } else {
+            println!(
+                "cargo-machete-nk didn't find any unused or ignored used dependencies. Good job!",
+            );
+        }
     }
 
     // save cache
@@ -231,15 +238,7 @@ fn init_args() -> anyhow::Result<MacheteArgs> {
 fn init_cache(args: &MacheteArgs) -> Cache {
     let cache_serialized = {
         if let Some(cache_path) = &args.cache_path {
-            let mut cache_serialized = String::new();
-            let mut file = fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .open(cache_path)
-                .expect("Could not open a file provided in `cache_path` arg");
-            file.read_to_string(&mut cache_serialized).unwrap();
-            cache_serialized
+            std::fs::read_to_string(cache_path).unwrap_or_default()
         } else {
             String::new()
         }
@@ -377,8 +376,14 @@ fn analyze_packages(
     });
 }
 
-fn remove_dependencies(manifest: &str, dependencies_list: &[String]) -> anyhow::Result<String> {
+fn remove_dependencies(
+    manifest: &str,
+    dependencies_list: &[String],
+    ignored_used: &[String],
+) -> anyhow::Result<String> {
     let mut manifest = toml_edit::Document::from_str(manifest)?;
+
+    // Fix unused
     let dependencies = manifest
         .iter_mut()
         .find_map(|(k, v)| (v.is_table_like() && k == "dependencies").then_some(Some(v)))
@@ -401,6 +406,18 @@ fn remove_dependencies(manifest: &str, dependencies_list: &[String]) -> anyhow::
             dependencies
                 .remove(&replaced)
                 .with_context(|| format!("Dependency {k} not found"))?;
+        }
+    }
+
+    // Fix ignored_used
+    if let Some(table) = manifest["package"]["metadata"]["cargo-machete"].as_table_mut() {
+        if let Some(s) = table.get_mut("ignored") {
+            let ignored = s.as_array_mut().expect("ignored MUST be an array");
+            ignored.retain(|i| {
+                ignored_used
+                    .iter()
+                    .all(|iu| iu != i.as_str().expect("Ignored elements MUST be of type string"))
+            });
         }
     }
 
