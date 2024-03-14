@@ -1,5 +1,5 @@
 [package]
-name = "cargo-machete"
+name = "cargo-machete-nk"
 edition = "2021"
 version = "0.7.0"
 description = "Find unused dependencies with this one weird trick!"
