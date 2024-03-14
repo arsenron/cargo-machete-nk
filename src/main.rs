@@ -339,12 +339,14 @@ fn test_ignore_target() {
     let entries = collect_paths(
         &PathBuf::from(TOP_LEVEL).join("./integration-tests/with-target/"),
         true,
+        &[],
     );
     assert!(entries.unwrap().is_empty());
 
     let entries = collect_paths(
         &PathBuf::from(TOP_LEVEL).join("./integration-tests/with-target/"),
         false,
+        &[],
     );
     assert!(!entries.unwrap().is_empty());
 }
