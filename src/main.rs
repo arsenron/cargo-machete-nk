@@ -6,9 +6,9 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::os::unix::fs::FileExt;
+use std::io::Read;
 use std::path::Path;
+use std::process::ExitCode;
 use std::str::FromStr;
 use std::sync::mpsc;
 use std::{fs, path::PathBuf};
@@ -16,7 +16,7 @@ use walkdir::{DirEntry, WalkDir};
 
 #[derive(argh::FromArgs, Debug)]
 #[argh(description = r#"
-cargo-machete: Helps find unused dependencies in a fast yet imprecise way.
+cargo-machete-nk: Helps find unused dependencies in a fast yet imprecise way (unless `with_metadata` flag is provided).
 
 Exit code:
     0:  when no unused dependencies are found
@@ -35,7 +35,10 @@ struct MacheteArgs {
     skip_target_dir: bool,
 
     /// rewrite the Cargo.toml files to automatically remove unused dependencies.
-    /// Note: all dependencies flagged by cargo-machete will be removed, including false positives.
+    ///
+    /// Notes:
+    /// - all dependencies flagged by cargo-machete-nk will be removed, including false positives.
+    /// - does not fix ignored_used for now (but can).
     #[argh(switch)]
     fix: bool,
 
@@ -56,8 +59,8 @@ struct MacheteArgs {
     cache_path: Option<PathBuf>,
 }
 
-/// Runs `cargo-machete`.
-/// Returns Ok with a bool whether any unused dependencies were found, or Err on errors.
+/// Runs `cargo-machete-nk`.
+/// Returns Ok with a bool whether any unused dependencies or ignored_used were found, or Err on errors.
 fn run_machete() -> anyhow::Result<bool> {
     pretty_env_logger::init();
 
@@ -68,11 +71,10 @@ fn run_machete() -> anyhow::Result<bool> {
         .paths
         .clone()
         .into_iter()
-        .map(|path| {
+        .flat_map(|path| {
             collect_paths(&path, args.skip_target_dir, &args.exclude)
                 .expect("Could not analyze dependencies in {path:?}")
         })
-        .flatten()
         .collect();
 
     for path in manifest_path_entries {
@@ -99,8 +101,7 @@ fn run_machete() -> anyhow::Result<bool> {
     let unchecked_packages = cache
         .records
         .iter()
-        .filter(|(path, dep)| dep.deps.is_none())
-        .map(|(path, dep)| path.to_owned())
+        .filter_map(|(path, dep)| dep.deps.is_none().then_some(path.to_owned()))
         .collect();
     let (to_cache_sender, analyzed_deps) = mpsc::channel();
     let cache_thread = std::thread::spawn(move || {
@@ -117,8 +118,9 @@ fn run_machete() -> anyhow::Result<bool> {
     log::debug!("Cache after all the logic ran = {:#?}", cache);
 
     let mut has_unused_dependencies = false;
+    let mut has_ignored_used = false;
     let mut has_unused_dependencies_warning_shown = false;
-    for (path, mut cargo_dep) in &mut cache.records {
+    for (path, cargo_dep) in &mut cache.records {
         let Some(deps) = &mut cargo_dep.deps else {
             continue;
         };
@@ -127,40 +129,37 @@ fn run_machete() -> anyhow::Result<bool> {
         }
         if !has_unused_dependencies_warning_shown {
             println!(
-                "cargo-machete-nk found the following unused dependencies in {:?}:",
+                "cargo-machete-nk found unused or ignored_used dependencies in {:?}:",
                 args.paths
             );
             has_unused_dependencies_warning_shown = true;
         }
         println!("{} -- {}:", deps.package_name, path.to_string_lossy());
-        if !deps.unused.is_empty() {
-            has_unused_dependencies = true;
-        }
         for dep in &deps.unused {
-            println!("\t{dep}");
+            has_unused_dependencies = true;
+            println!("    ❗ {dep}");
         }
         for dep in &deps.ignored_used {
-            eprintln!("\t⚠️  {dep} was marked as ignored, but is actually used!");
+            has_ignored_used = true;
+            eprintln!("    ⚠️  {dep} was marked as ignored, but is actually used!");
         }
         if args.fix {
-            let fixed = remove_dependencies(&fs::read_to_string(&path)?, &deps.unused)?;
-            fs::write(&path, fixed).expect("Cargo.toml write error");
+            // todo: fix also ignored_used
+            let fixed = remove_dependencies(&fs::read_to_string(path)?, &deps.unused)?;
+            fs::write(path, fixed).expect("Cargo.toml write error");
             // Save new checksum after fix and clear unused deps
-            let new_checksum = checksum(&path);
+            let new_checksum = checksum(path);
             cargo_dep.checksum = new_checksum;
-            (*deps).unused = Vec::new();
+            deps.unused = Vec::new();
+            // after fix actually there would be no unused dependencies
+            has_unused_dependencies = false;
         }
-    }
-
-    if args.fix {
-        // after fix actually there would be no unused dependencies
-        has_unused_dependencies = false;
     }
 
     if has_unused_dependencies {
         println!(
             "\n\
-            If you believe cargo-machete has detected an unused dependency incorrectly,\n\
+            If you believe cargo-machete-nk has detected an unused dependency incorrectly,\n\
             you can add the dependency to the list of dependencies to ignore in the\n\
             `[package.metadata.cargo-machete]` section of the appropriate Cargo.toml.\n\
             For example:\n\
@@ -178,8 +177,10 @@ fn run_machete() -> anyhow::Result<bool> {
         }
 
         println!()
-    } else {
-        println!("cargo-machete didn't find any unused dependencies. Good job!",);
+    }
+
+    if !(has_unused_dependencies || has_ignored_used) {
+        println!("cargo-machete-nk didn't find any unused or ignored used dependencies. Good job!",);
     }
 
     // save cache
@@ -189,9 +190,7 @@ fn run_machete() -> anyhow::Result<bool> {
         }
     }
 
-    eprintln!("Done!");
-
-    Ok(has_unused_dependencies)
+    Ok(has_unused_dependencies || has_ignored_used)
 }
 
 fn init_args() -> anyhow::Result<MacheteArgs> {
@@ -230,7 +229,7 @@ fn init_args() -> anyhow::Result<MacheteArgs> {
 }
 
 fn init_cache(args: &MacheteArgs) -> Cache {
-    let mut cache_serialized = {
+    let cache_serialized = {
         if let Some(cache_path) = &args.cache_path {
             let mut cache_serialized = String::new();
             let mut file = fs::OpenOptions::new()
@@ -262,7 +261,7 @@ fn is_hidden(entry: &DirEntry) -> bool {
     entry
         .file_name()
         .to_str()
-        .map(|s| s.starts_with("."))
+        .map(|s| s.starts_with('.'))
         .unwrap_or(false)
 }
 
@@ -318,7 +317,7 @@ fn running_as_cargo_cmd() -> bool {
 
 fn checksum(file: &Path) -> String {
     let bytes = fs::read(file).unwrap();
-    hex::encode(Sha256::digest(&bytes).to_vec())
+    hex::encode(Sha256::digest(bytes))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -386,16 +385,16 @@ fn remove_dependencies(manifest: &str, dependencies_list: &[String]) -> anyhow::
         .flatten()
         .context("dependencies table is missing or empty")?
         .as_table_mut()
-        .context("unexpected missing table, please report with a test case on https://github.com/bnjbvr/cargo-machete")?;
+        .context("unexpected missing table, please report with a test case on https://github.com/arsenron/cargo-machete-nk")?;
 
     for k in dependencies_list {
         let removed = dependencies.remove(k);
         // Cannot find a dependency, so check for `-` or `_` clash
         if removed.is_none() {
-            let replaced = if k.contains("_") {
-                k.replace("_", "-")
-            } else if k.contains("-") {
-                k.replace("-", "_")
+            let replaced = if k.contains('_') {
+                k.replace('_', "-")
+            } else if k.contains('-') {
+                k.replace('-', "_")
             } else {
                 bail!("Dependency {k} not found")
             };
@@ -409,7 +408,7 @@ fn remove_dependencies(manifest: &str, dependencies_list: &[String]) -> anyhow::
     Ok(serialized)
 }
 
-fn main() {
+fn main() -> ExitCode {
     let exit_code = match run_machete() {
         Ok(false) => 0,
         Ok(true) => 1,
@@ -419,7 +418,7 @@ fn main() {
         }
     };
 
-    std::process::exit(exit_code);
+    ExitCode::from(exit_code)
 }
 
 #[cfg(test)]

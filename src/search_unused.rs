@@ -40,14 +40,12 @@ mod meta {
 pub(crate) struct PackageAnalysis {
     metadata: Option<cargo_metadata::Metadata>,
     pub manifest: cargo_toml::Manifest<meta::PackageMetadata>,
-    pub package_name: String,
     pub unused: Vec<String>,
     pub ignored_used: Vec<String>,
 }
 
 impl PackageAnalysis {
     fn new(
-        package_name: String,
         cargo_path: &Path,
         manifest: cargo_toml::Manifest<meta::PackageMetadata>,
         with_cargo_metadata: bool,
@@ -67,7 +65,6 @@ impl PackageAnalysis {
         Ok(Self {
             metadata,
             manifest,
-            package_name,
             unused: Default::default(),
             ignored_used: Default::default(),
         })
@@ -100,15 +97,13 @@ fn make_multiline_regexp(name: &str) -> String {
 }
 
 /// Returns all the paths to the Rust source files for a crate contained at the given path.
-fn collect_paths(dir_path: &Path, analysis: &PackageAnalysis) -> Vec<PathBuf> {
+fn collect_paths(
+    dir_path: &Path,
+    manifest: &cargo_toml::Manifest<meta::PackageMetadata>,
+) -> Vec<PathBuf> {
     let mut root_paths = HashSet::new();
 
-    if let Some(path) = analysis
-        .manifest
-        .lib
-        .as_ref()
-        .and_then(|lib| lib.path.as_ref())
-    {
+    if let Some(path) = manifest.lib.as_ref().and_then(|lib| lib.path.as_ref()) {
         assert!(
             path.ends_with(".rs"),
             "paths provided by cargo_toml are to Rust files"
@@ -119,13 +114,12 @@ fn collect_paths(dir_path: &Path, analysis: &PackageAnalysis) -> Vec<PathBuf> {
         root_paths.insert(path_buf);
     }
 
-    for product in analysis
-        .manifest
+    for product in manifest
         .bin
         .iter()
-        .chain(analysis.manifest.bench.iter())
-        .chain(analysis.manifest.test.iter())
-        .chain(analysis.manifest.example.iter())
+        .chain(manifest.bench.iter())
+        .chain(manifest.test.iter())
+        .chain(manifest.example.iter())
     {
         if let Some(ref path) = product.path {
             assert!(
@@ -334,12 +328,7 @@ pub(crate) fn analyze_package(
 
     debug!("handling {} ({})", package_name, dir_path.display());
 
-    let mut analysis = PackageAnalysis::new(
-        package_name.clone(),
-        manifest_path,
-        manifest,
-        with_cargo_metadata,
-    )?;
+    let mut analysis = PackageAnalysis::new(manifest_path, manifest, with_cargo_metadata)?;
 
     // TODO extend to dev dependencies + build dependencies, and be smarter in the grouping of
     // searched paths
@@ -399,7 +388,7 @@ pub(crate) fn analyze_package(
         IgnoredButUsed(String),
     }
 
-    let paths = collect_paths(&dir_path, &analysis);
+    let paths = collect_paths(&dir_path, &analysis.manifest);
     let results: Vec<SingleDepResult> = dependencies_names
         .into_par_iter()
         .filter_map(|name| {
@@ -647,7 +636,7 @@ pub use futures::future;
 
 #[cfg(test)]
 fn check_analysis<F: Fn(PackageAnalysis)>(rel_path: &str, callback: F) {
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = std::sync::mpsc::channel();
     for use_cargo_metadata in [true, false] {
         let analysis = analyze_package(
             &PathBuf::from(TOP_LEVEL).join(rel_path),
@@ -734,7 +723,7 @@ fn test_with_bench() {
 fn test_crate_renaming_works() -> anyhow::Result<()> {
     // when a lib like xml-rs is exposed with a different name, cargo-machete doesn't return false
     // positives.
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = std::sync::mpsc::channel();
     let analysis = analyze_package(
         &PathBuf::from(TOP_LEVEL).join("./integration-tests/renaming-works/Cargo.toml"),
         true,
