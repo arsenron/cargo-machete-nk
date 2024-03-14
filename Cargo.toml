@@ -3,8 +3,11 @@ name = "cargo-machete-nk"
 edition = "2021"
 version = "0.8.0"
 description = "Find unused dependencies with this one weird trick!"
-authors = ["Benjamin Bouvier <public@benj.me>"]
-repository = "https://github.com/bnjbvr/cargo-machete"
+authors = [
+    "Benjamin Bouvier <public@benj.me>",
+    "Arsenii Ronzhyn <arsenron@gmail.com>",
+]
+repository = "https://github.com/arsenron/cargo-machete-nk"
 keywords = []
 categories = []
 license = "MIT"

@@ -1,3 +1,9 @@
+# 0.8.0
+
+- Breaking: when ignore used is found, the program finishes with exit code 1
+- Added: `--cache-path` - recompile dependencies only for projects that were used 
+
+
 # 0.6.0 (released on 2023-09-23)
 
 - *Breaking*/improved: match against crate name case-insensitive (#69).
