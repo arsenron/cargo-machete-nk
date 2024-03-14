@@ -1,12 +1,12 @@
 mod search_unused;
 
 use crate::search_unused::find_unused;
-use anyhow::Context;
+use anyhow::{Context, bail};
 use rayon::prelude::*;
 use std::path::Path;
 use std::str::FromStr;
 use std::{fs, path::PathBuf};
-use walkdir::WalkDir;
+use walkdir::{DirEntry, WalkDir};
 
 #[derive(Clone, Copy)]
 pub(crate) enum UseCargoMetadata {
@@ -37,7 +37,7 @@ impl From<bool> for UseCargoMetadata {
     }
 }
 
-#[derive(argh::FromArgs)]
+#[derive(argh::FromArgs, Debug)]
 #[argh(description = r#"
 cargo-machete: Helps find unused dependencies in a fast yet imprecise way.
 
@@ -67,20 +67,46 @@ struct MacheteArgs {
     version: bool,
 
     /// paths to directories that must be scanned.
-    #[argh(positional, greedy)]
+    #[argh(option)]
     paths: Vec<PathBuf>,
+
+    /// directories to exclude
+    #[argh(option)]
+    exclude: Vec<PathBuf>,
 }
 
-fn collect_paths(path: &Path, skip_target_dir: bool) -> Result<Vec<PathBuf>, walkdir::Error> {
-    // Find directory entries.
+fn is_hidden(entry: &DirEntry) -> bool {
+    entry
+        .file_name()
+        .to_str()
+        .map(|s| s.starts_with("."))
+        .unwrap_or(false)
+}
+
+/// Checks whether entry is included into `into`
+fn is_included(entry: &DirEntry, into: &[PathBuf]) -> bool {
+    into.iter().any(|i| entry.path().starts_with(i))
+}
+
+fn collect_paths(
+    path: &Path,
+    skip_target_dir: bool,
+    to_exclude: &[PathBuf],
+) -> Result<Vec<PathBuf>, walkdir::Error> {
     let walker = WalkDir::new(path).into_iter();
 
     let manifest_path_entries = if skip_target_dir {
         walker
-            .filter_entry(|entry| !entry.path().ends_with("target"))
+            .filter_entry(|entry| {
+                !is_included(entry, to_exclude)
+                    && !is_hidden(entry)
+                    && !entry.path().ends_with("target")
+            })
             .collect()
     } else {
-        walker.collect::<Vec<_>>()
+        walker
+            .filter_entry(|entry| !is_included(entry, to_exclude) && !is_hidden(entry))
+            .collect::<Vec<_>>()
     };
 
     // Keep only errors and `Cargo.toml` files (filter), then map correct paths into owned
@@ -118,6 +144,8 @@ fn run_machete() -> anyhow::Result<bool> {
         argh::from_env()
     };
 
+    // eprintln!("args = {:#?}", args);
+
     if args.version {
         println!("{}", env!("CARGO_PKG_VERSION"));
         std::process::exit(0);
@@ -138,11 +166,20 @@ fn run_machete() -> anyhow::Result<bool> {
         );
     }
 
+    let base_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    for p in &mut args.exclude {
+        *p = base_dir.join(p.clone());
+        if !p.exists() {
+            bail!("Exclude path `{p:?}` does not exist");
+        }
+    }
+
     let mut has_unused_dependencies = false;
     let mut walkdir_errors = Vec::new();
 
     for path in args.paths {
-        let manifest_path_entries = match collect_paths(&path, args.skip_target_dir) {
+        let manifest_path_entries = match collect_paths(&path, args.skip_target_dir, &args.exclude)
+        {
             Ok(entries) => entries,
             Err(err) => {
                 walkdir_errors.push(err);
