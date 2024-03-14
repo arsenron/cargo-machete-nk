@@ -1,42 +1,42 @@
 <div align="center">
-  <h1><code>cargo-machete</code></h1>
+  <h1><code>cargo-machete-nk</code></h1>
 
   <p>
     <strong>Remove unused Rust dependencies with this one weird trick!</strong>
   </p>
 
   <p>
-    <a href="https://github.com/bnjbvr/cargo-machete/actions?query=workflow%3ARust"><img src="https://github.com/bnjbvr/cargo-machete/workflows/Rust/badge.svg" alt="build status" /></a>
-    <a href="https://matrix.to/#/#cargo-machete:delire.party"><img src="https://img.shields.io/badge/matrix-join_chat-brightgreen.svg" alt="matrix chat" /></a>
     <img src="https://img.shields.io/badge/rustc-stable+-green.svg" alt="supported rustc stable" />
   </p>
 </div>
 
 ## Introduction
 
+This is a fork of `cargo-machete`, which adds a few additional features,
+such as `--exclude` flag to exclude provided subdirectories from the search.
 `cargo-machete` is a Cargo tool that detects unused dependencies in Rust
 projects, in a fast (yet imprecise) way.
 
-See also the [blog post](https://blog.benj.me/2022/04/27/cargo-machete/) for a
+See also the [original author's blog post](https://blog.benj.me/2022/04/27/cargo-machete/) for a
 detailed writeup.
 
 ## Installation
 
-Install `cargo-machete` with cargo:
+Install `cargo-machete-nk` with cargo:
 
-`cargo install cargo-machete`
+`cargo install cargo-machete-nk`
 
 ## Usage
 
-Run cargo-machete in a directory that contains one or more Rust projects (using Cargo for
+Run cargo-machete-nk in a directory that contains one or more Rust projects (using Cargo for
 dependency management):
 
 ```bash
-cd my-directory && cargo machete
+cd my-directory && cargo machete-nk
 
 # alternatively
 
-cargo machete /absolute/path/to/my/directory
+cargo machete-nk /absolute/path/to/my/directory
 ```
 
 The **return code** gives an indication whether unused dependencies have been found:
@@ -74,40 +74,6 @@ flag, which will call `cargo metadata --all-features` to find final dependency
 names, more accurate dependencies per build type, etc. ⚠ This may modify the
 `Cargo.lock` files in your projects.
 
-## Cargo Machete Action
-
-A github action for cargo machete.
-
-### Example usage
-
-The step given by,
-```
-      - uses: bnjbvr/cargo-machete@main
-```
-can be added to any workflow.
-
-An example workflow is shown below:
-
-```yaml
-name: Cargo Machete
-on:
-  pull_request: { branches: "*" }
-
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-      - name: Machete
-        uses: bnjbvr/cargo-machete@main
-```
-
-## Contributing
-
-[![Contributor Covenant](https://img.shields.io/badge/contributor%20covenant-v1.4-ff69b4.svg)](https://www.contributor-covenant.org/version/1/4/code-of-conduct/)
-
-We welcome community contributions to this project.
 
 ## License
 
