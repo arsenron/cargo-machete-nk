@@ -242,6 +242,7 @@ fn run_machete() -> anyhow::Result<bool> {
             }
 
             if args.fix {
+                has_unused_dependencies = false; // after fix actually there would be no unused dependencies
                 let fixed = remove_dependencies(&fs::read_to_string(path)?, &analysis.unused)?;
                 fs::write(path, fixed).expect("Cargo.toml write error");
             }
