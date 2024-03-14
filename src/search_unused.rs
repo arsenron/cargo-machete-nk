@@ -1,4 +1,4 @@
-use cargo_metadata::CargoOpt;
+use cargo_metadata::{CargoOpt, DependencyKind};
 use grep::{
     matcher::LineTerminator,
     regex::{RegexMatcher, RegexMatcherBuilder},
@@ -339,8 +339,6 @@ pub(crate) fn find_unused(
         with_cargo_metadata.into(),
     )?;
 
-    let paths = collect_paths(&dir_path, &analysis);
-
     // TODO extend to dev dependencies + build dependencies, and be smarter in the grouping of
     // searched paths
     let dependencies_names: Vec<_> = if let Some(resolve) = analysis
@@ -362,6 +360,18 @@ pub(crate) fn find_unused(
             .expect("the current package must be in the dependency graph")
             .deps
             .iter()
+            .filter(|node_dep| {
+                // todo: here we remove deps that are not normal,
+                //  but it should be handled another way.
+                //  We should return not a string for a dep name, but also a kind and parse it later
+                for dep_kind_info in &node_dep.dep_kinds {
+                    let dep_kind = dep_kind_info.kind;
+                    if matches!(dep_kind, DependencyKind::Normal) {
+                        return true;
+                    }
+                }
+                false
+            })
             .map(|node_dep| node_dep.name.clone())
             .collect()
     } else {
@@ -387,6 +397,7 @@ pub(crate) fn find_unused(
         IgnoredButUsed(String),
     }
 
+    let paths = collect_paths(&dir_path, &analysis);
     let results: Vec<SingleDepResult> = dependencies_names
         .into_par_iter()
         .filter_map(|name| {

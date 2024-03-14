@@ -1,7 +1,7 @@
 mod search_unused;
 
 use crate::search_unused::find_unused;
-use anyhow::{Context, bail};
+use anyhow::{bail, Context};
 use rayon::prelude::*;
 use std::path::Path;
 use std::str::FromStr;
@@ -166,7 +166,7 @@ fn run_machete() -> anyhow::Result<bool> {
         );
     }
 
-    let base_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let base_dir = std::env::current_dir()?;
     for p in &mut args.exclude {
         *p = base_dir.join(p.clone());
         if !p.exists() {
@@ -298,9 +298,20 @@ fn remove_dependencies(manifest: &str, dependencies_list: &[String]) -> anyhow::
         .context("unexpected missing table, please report with a test case on https://github.com/bnjbvr/cargo-machete")?;
 
     for k in dependencies_list {
-        dependencies
-            .remove(k)
-            .with_context(|| format!("Dependency {k} not found"))?;
+        let removed = dependencies.remove(k);
+        // Cannot find a dependency, so check for `-` or `_` clash
+        if removed.is_none() {
+            let replaced = if k.contains("_") {
+                k.replace("_", "-")
+            } else if k.contains("-") {
+                k.replace("-", "_")
+            } else {
+                bail!("Dependency {k} not found")
+            };
+            dependencies
+                .remove(&replaced)
+                .with_context(|| format!("Dependency {k} not found"))?;
+        }
     }
 
     let serialized = manifest.to_string();
