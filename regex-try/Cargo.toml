@@ -9,3 +9,4 @@ edition = "2021"
 anyhow = "1.0.53"
 dioxus = { version = "0.1.7", features = ["desktop"] }
 grep = "0.2.8"
+strum = "0.26.1"

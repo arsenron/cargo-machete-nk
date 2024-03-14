@@ -10,10 +10,11 @@ use std::{
     collections::HashSet,
     error::{self, Error},
     path::{Path, PathBuf},
+    sync::mpsc::Sender,
 };
 use walkdir::WalkDir;
 
-use crate::UseCargoMetadata;
+use crate::Deps;
 #[cfg(test)]
 use crate::TOP_LEVEL;
 
@@ -314,9 +315,10 @@ fn get_full_manifest(
     Ok((manifest, workspace_ignored))
 }
 
-pub(crate) fn find_unused(
+pub(crate) fn analyze_package(
     manifest_path: &Path,
-    with_cargo_metadata: UseCargoMetadata,
+    with_cargo_metadata: bool,
+    to_cache: Sender<(PathBuf, Deps)>,
 ) -> anyhow::Result<Option<PackageAnalysis>> {
     let mut dir_path = manifest_path.to_path_buf();
     dir_path.pop();
@@ -336,7 +338,7 @@ pub(crate) fn find_unused(
         package_name.clone(),
         manifest_path,
         manifest,
-        with_cargo_metadata.into(),
+        with_cargo_metadata,
     )?;
 
     // TODO extend to dev dependencies + build dependencies, and be smarter in the grouping of
@@ -440,6 +442,17 @@ pub(crate) fn find_unused(
             SingleDepResult::IgnoredButUsed(dep) => analysis.ignored_used.push(dep),
         }
     }
+
+    to_cache
+        .send((
+            manifest_path.to_owned(),
+            Deps {
+                unused: analysis.unused.clone(),
+                ignored_used: analysis.ignored_used.clone(),
+                package_name,
+            },
+        ))
+        .unwrap();
 
     Ok(Some(analysis))
 }
@@ -634,10 +647,12 @@ pub use futures::future;
 
 #[cfg(test)]
 fn check_analysis<F: Fn(PackageAnalysis)>(rel_path: &str, callback: F) {
-    for use_cargo_metadata in UseCargoMetadata::all() {
-        let analysis = find_unused(
+    let (tx, rx) = std::sync::mpsc::channel();
+    for use_cargo_metadata in [true, false] {
+        let analysis = analyze_package(
             &PathBuf::from(TOP_LEVEL).join(rel_path),
-            *use_cargo_metadata,
+            use_cargo_metadata,
+            tx.clone(),
         )
         .expect("find_unused must return an Ok result")
         .expect("no error during processing");
@@ -719,17 +734,20 @@ fn test_with_bench() {
 fn test_crate_renaming_works() -> anyhow::Result<()> {
     // when a lib like xml-rs is exposed with a different name, cargo-machete doesn't return false
     // positives.
-    let analysis = find_unused(
+    let (tx, rx) = std::sync::mpsc::channel();
+    let analysis = analyze_package(
         &PathBuf::from(TOP_LEVEL).join("./integration-tests/renaming-works/Cargo.toml"),
-        UseCargoMetadata::Yes,
+        true,
+        tx.clone(),
     )?
     .expect("no error during processing");
     assert!(analysis.unused.is_empty());
 
     // But when not using cargo-metadata, there's a false positive!
-    let analysis = find_unused(
+    let analysis = analyze_package(
         &PathBuf::from(TOP_LEVEL).join("./integration-tests/renaming-works/Cargo.toml"),
-        UseCargoMetadata::No,
+        false,
+        tx,
     )?
     .expect("no error during processing");
     assert_eq!(analysis.unused, &["xml-rs".to_string()]);

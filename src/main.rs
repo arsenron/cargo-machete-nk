@@ -1,41 +1,18 @@
 mod search_unused;
 
-use crate::search_unused::find_unused;
+use crate::search_unused::analyze_package;
 use anyhow::{bail, Context};
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::mpsc;
 use std::{fs, path::PathBuf};
 use walkdir::{DirEntry, WalkDir};
-
-#[derive(Clone, Copy)]
-pub(crate) enum UseCargoMetadata {
-    Yes,
-    No,
-}
-
-#[cfg(test)]
-impl UseCargoMetadata {
-    fn all() -> &'static [UseCargoMetadata] {
-        &[UseCargoMetadata::Yes, UseCargoMetadata::No]
-    }
-}
-
-impl From<UseCargoMetadata> for bool {
-    fn from(v: UseCargoMetadata) -> bool {
-        matches!(v, UseCargoMetadata::Yes)
-    }
-}
-
-impl From<bool> for UseCargoMetadata {
-    fn from(b: bool) -> Self {
-        if b {
-            Self::Yes
-        } else {
-            Self::No
-        }
-    }
-}
 
 #[derive(argh::FromArgs, Debug)]
 #[argh(description = r#"
@@ -73,6 +50,212 @@ struct MacheteArgs {
     /// directories to exclude
     #[argh(option)]
     exclude: Vec<PathBuf>,
+
+    /// preserve cache for manifest files that have not been changed.
+    #[argh(option)]
+    cache_path: Option<PathBuf>,
+}
+
+/// Runs `cargo-machete`.
+/// Returns Ok with a bool whether any unused dependencies were found, or Err on errors.
+fn run_machete() -> anyhow::Result<bool> {
+    pretty_env_logger::init();
+
+    let args = init_args()?;
+    let mut cache = init_cache(&args);
+
+    let manifest_path_entries: Vec<PathBuf> = args
+        .paths
+        .clone()
+        .into_iter()
+        .map(|path| {
+            collect_paths(&path, args.skip_target_dir, &args.exclude)
+                .expect("Could not analyze dependencies in {path:?}")
+        })
+        .flatten()
+        .collect();
+
+    for path in manifest_path_entries {
+        let current_checksum = checksum(&path);
+        if let Some(cached_entry) = cache.records.get_mut(&path) {
+            if cached_entry.checksum != current_checksum {
+                *cached_entry = CargoDep {
+                    checksum: current_checksum,
+                    deps: None,
+                }
+            }
+        } else {
+            cache.records.insert(
+                path,
+                CargoDep {
+                    checksum: current_checksum,
+                    deps: None,
+                },
+            );
+        }
+    }
+
+    log::debug!("Cache after checksum checks = {:#?}", cache);
+    let unchecked_packages = cache
+        .records
+        .iter()
+        .filter(|(path, dep)| dep.deps.is_none())
+        .map(|(path, dep)| path.to_owned())
+        .collect();
+    let (to_cache_sender, analyzed_deps) = mpsc::channel();
+    let cache_thread = std::thread::spawn(move || {
+        while let Ok((path, deps)) = analyzed_deps.recv() {
+            let cache_entry = cache.records.get_mut(&path).expect("Infallible");
+            cache_entry.deps = Some(deps);
+        }
+        cache
+    });
+
+    analyze_packages(unchecked_packages, args.with_metadata, to_cache_sender);
+
+    let mut cache = cache_thread.join().unwrap();
+    log::debug!("Cache after all the logic ran = {:#?}", cache);
+
+    let mut has_unused_dependencies = false;
+    let mut has_unused_dependencies_warning_shown = false;
+    for (path, mut cargo_dep) in &mut cache.records {
+        let Some(deps) = &mut cargo_dep.deps else {
+            continue;
+        };
+        if deps.ignored_used.is_empty() && deps.unused.is_empty() {
+            continue;
+        }
+        if !has_unused_dependencies_warning_shown {
+            println!(
+                "cargo-machete-nk found the following unused dependencies in {:?}:",
+                args.paths
+            );
+            has_unused_dependencies_warning_shown = true;
+        }
+        println!("{} -- {}:", deps.package_name, path.to_string_lossy());
+        if !deps.unused.is_empty() {
+            has_unused_dependencies = true;
+        }
+        for dep in &deps.unused {
+            println!("\t{dep}");
+        }
+        for dep in &deps.ignored_used {
+            eprintln!("\t⚠️  {dep} was marked as ignored, but is actually used!");
+        }
+        if args.fix {
+            let fixed = remove_dependencies(&fs::read_to_string(&path)?, &deps.unused)?;
+            fs::write(&path, fixed).expect("Cargo.toml write error");
+            // Save new checksum after fix and clear unused deps
+            let new_checksum = checksum(&path);
+            cargo_dep.checksum = new_checksum;
+            (*deps).unused = Vec::new();
+        }
+    }
+
+    if args.fix {
+        // after fix actually there would be no unused dependencies
+        has_unused_dependencies = false;
+    }
+
+    if has_unused_dependencies {
+        println!(
+            "\n\
+            If you believe cargo-machete has detected an unused dependency incorrectly,\n\
+            you can add the dependency to the list of dependencies to ignore in the\n\
+            `[package.metadata.cargo-machete]` section of the appropriate Cargo.toml.\n\
+            For example:\n\
+            \n\
+            [package.metadata.cargo-machete]\n\
+            ignored = [\"prost\"]"
+        );
+
+        if !args.with_metadata {
+            println!(
+                "\n\
+                You can also try running it with the `--with-metadata` flag for better accuracy,\n\
+                though this may modify your Cargo.lock files."
+            );
+        }
+
+        println!()
+    } else {
+        println!("cargo-machete didn't find any unused dependencies. Good job!",);
+    }
+
+    // save cache
+    if let Some(cache_path) = args.cache_path {
+        if let Err(e) = persist_cache(cache, cache_path) {
+            eprintln!("Could not persist cache due to - {e:?}");
+        }
+    }
+
+    eprintln!("Done!");
+
+    Ok(has_unused_dependencies)
+}
+
+fn init_args() -> anyhow::Result<MacheteArgs> {
+    let mut args: MacheteArgs = if running_as_cargo_cmd() {
+        argh::cargo_from_env()
+    } else {
+        argh::from_env()
+    };
+    log::debug!("args = {:#?}", args);
+    if args.version {
+        println!("{}", env!("CARGO_PKG_VERSION"));
+        std::process::exit(0);
+    }
+    if args.paths.is_empty() {
+        eprintln!("Analyzing dependencies of crates in this directory...");
+        args.paths.push(std::env::current_dir()?);
+    } else {
+        eprintln!(
+            "Analyzing dependencies of crates in {}...",
+            args.paths
+                .iter()
+                .cloned()
+                .map(|path| path.as_os_str().to_string_lossy().to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+    }
+    let base_dir = std::env::current_dir()?;
+    for p in &mut args.exclude {
+        *p = base_dir.join(p.clone());
+        if !p.exists() {
+            bail!("Exclude path `{p:?}` does not exist");
+        }
+    }
+    Ok(args)
+}
+
+fn init_cache(args: &MacheteArgs) -> Cache {
+    let mut cache_serialized = {
+        if let Some(cache_path) = &args.cache_path {
+            let mut cache_serialized = String::new();
+            let mut file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .open(cache_path)
+                .expect("Could not open a file provided in `cache_path` arg");
+            file.read_to_string(&mut cache_serialized).unwrap();
+            cache_serialized
+        } else {
+            String::new()
+        }
+    };
+
+    // Stick with default if either something is wrong with the cache or it is empty
+    let mut cache: Cache =
+        serde_json::from_str(&cache_serialized).unwrap_or(Cache::with_paths(args.paths.clone()));
+    if cache.paths != args.paths {
+        // Clear cache for different paths
+        // todo: we can cache per paths (make combination of paths as keys to cache.)
+        cache = Cache::with_paths(args.paths.clone())
+    }
+    log::debug!("Initial Cache = {:#?}", cache);
+    cache
 }
 
 fn is_hidden(entry: &DirEntry) -> bool {
@@ -133,159 +316,66 @@ fn running_as_cargo_cmd() -> bool {
     std::env::var("CARGO").is_ok() && std::env::var("CARGO_PKG_NAME").is_err()
 }
 
-/// Runs `cargo-machete`.
-/// Returns Ok with a bool whether any unused dependencies were found, or Err on errors.
-fn run_machete() -> anyhow::Result<bool> {
-    pretty_env_logger::init();
+fn checksum(file: &Path) -> String {
+    let bytes = fs::read(file).unwrap();
+    hex::encode(Sha256::digest(&bytes).to_vec())
+}
 
-    let mut args: MacheteArgs = if running_as_cargo_cmd() {
-        argh::cargo_from_env()
-    } else {
-        argh::from_env()
-    };
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Cache {
+    records: HashMap<PathBuf, CargoDep>,
+    paths: Vec<PathBuf>,
+}
 
-    // eprintln!("args = {:#?}", args);
-
-    if args.version {
-        println!("{}", env!("CARGO_PKG_VERSION"));
-        std::process::exit(0);
-    }
-
-    if args.paths.is_empty() {
-        eprintln!("Analyzing dependencies of crates in this directory...");
-        args.paths.push(std::env::current_dir()?);
-    } else {
-        eprintln!(
-            "Analyzing dependencies of crates in {}...",
-            args.paths
-                .iter()
-                .cloned()
-                .map(|path| path.as_os_str().to_string_lossy().to_string())
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-    }
-
-    let base_dir = std::env::current_dir()?;
-    for p in &mut args.exclude {
-        *p = base_dir.join(p.clone());
-        if !p.exists() {
-            bail!("Exclude path `{p:?}` does not exist");
+impl Cache {
+    pub fn with_paths(paths: Vec<PathBuf>) -> Self {
+        Self {
+            records: Default::default(),
+            paths,
         }
     }
+}
 
-    let mut has_unused_dependencies = false;
-    let mut walkdir_errors = Vec::new();
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CargoDep {
+    pub checksum: String,
+    pub deps: Option<Deps>,
+}
 
-    for path in args.paths {
-        let manifest_path_entries = match collect_paths(&path, args.skip_target_dir, &args.exclude)
-        {
-            Ok(entries) => entries,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Deps {
+    pub unused: Vec<String>,
+    pub ignored_used: Vec<String>,
+    pub package_name: String,
+}
+
+fn persist_cache(cache: Cache, cache_path: PathBuf) -> anyhow::Result<()> {
+    let serialized = serde_json::to_string_pretty(&cache)?;
+    std::fs::write(cache_path, serialized)?;
+
+    Ok(())
+}
+
+fn analyze_packages(
+    entries: Vec<PathBuf>,
+    with_metadata: bool,
+    to_cache: mpsc::Sender<(PathBuf, Deps)>,
+) {
+    entries.par_iter().for_each(|manifest_path| {
+        match analyze_package(manifest_path, with_metadata, to_cache.clone()) {
+            Ok(None) => {
+                log::info!(
+                    "{} is a virtual manifest for a workspace",
+                    manifest_path.to_string_lossy()
+                );
+            }
+
             Err(err) => {
-                walkdir_errors.push(err);
-                continue;
+                eprintln!("error when handling {}: {}", manifest_path.display(), err);
             }
-        };
-
-        // Run analysis in parallel. This will spawn new rayon tasks when dependencies are effectively
-        // used by any Rust crate.
-        let results = manifest_path_entries
-            .par_iter()
-            .filter_map(|manifest_path| {
-                match find_unused(manifest_path, args.with_metadata.into()) {
-                    Ok(Some(analysis)) => {
-                        if analysis.unused.is_empty() {
-                            None
-                        } else {
-                            Some((analysis, manifest_path))
-                        }
-                    }
-
-                    Ok(None) => {
-                        log::info!(
-                            "{} is a virtual manifest for a workspace",
-                            manifest_path.to_string_lossy()
-                        );
-                        None
-                    }
-
-                    Err(err) => {
-                        eprintln!("error when handling {}: {}", manifest_path.display(), err);
-                        None
-                    }
-                }
-            })
-            .collect::<Vec<_>>();
-
-        // Display all the results.
-        if results.is_empty() {
-            println!(
-                "cargo-machete didn't find any unused dependencies in {}. Good job!",
-                path.to_string_lossy()
-            );
-            continue;
+            _ => (),
         }
-
-        println!(
-            "cargo-machete found the following unused dependencies in {}:",
-            path.to_string_lossy()
-        );
-        for (analysis, path) in results {
-            println!("{} -- {}:", analysis.package_name, path.to_string_lossy());
-            for dep in &analysis.unused {
-                println!("\t{dep}");
-                has_unused_dependencies = true; // any unused dependency is enough to set flag to true
-            }
-
-            for dep in &analysis.ignored_used {
-                eprintln!("\t⚠️  {dep} was marked as ignored, but is actually used!");
-            }
-
-            if args.fix {
-                has_unused_dependencies = false; // after fix actually there would be no unused dependencies
-                let fixed = remove_dependencies(&fs::read_to_string(path)?, &analysis.unused)?;
-                fs::write(path, fixed).expect("Cargo.toml write error");
-            }
-        }
-    }
-
-    if has_unused_dependencies {
-        println!(
-            "\n\
-            If you believe cargo-machete has detected an unused dependency incorrectly,\n\
-            you can add the dependency to the list of dependencies to ignore in the\n\
-            `[package.metadata.cargo-machete]` section of the appropriate Cargo.toml.\n\
-            For example:\n\
-            \n\
-            [package.metadata.cargo-machete]\n\
-            ignored = [\"prost\"]"
-        );
-
-        if !args.with_metadata {
-            println!(
-                "\n\
-                You can also try running it with the `--with-metadata` flag for better accuracy,\n\
-                though this may modify your Cargo.lock files."
-            );
-        }
-
-        println!()
-    }
-
-    eprintln!("Done!");
-
-    if !walkdir_errors.is_empty() {
-        anyhow::bail!(
-            "Errors when walking over directories:\n{}",
-            walkdir_errors
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-    }
-
-    Ok(has_unused_dependencies)
+    });
 }
 
 fn remove_dependencies(manifest: &str, dependencies_list: &[String]) -> anyhow::Result<String> {
