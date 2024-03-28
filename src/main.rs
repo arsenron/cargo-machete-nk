@@ -5,7 +5,7 @@ use anyhow::{bail, Context};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::ExitCode;
 use std::str::FromStr;
@@ -321,7 +321,7 @@ fn checksum(file: &Path) -> String {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Cache {
-    records: HashMap<PathBuf, CargoDep>,
+    records: BTreeMap<PathBuf, CargoDep>,
     paths: Vec<PathBuf>,
 }
 
@@ -347,7 +347,8 @@ pub struct Deps {
     pub package_name: String,
 }
 
-fn persist_cache(cache: Cache, cache_path: PathBuf) -> anyhow::Result<()> {
+fn persist_cache(mut cache: Cache, cache_path: PathBuf) -> anyhow::Result<()> {
+    cache.paths.sort();
     let serialized = serde_json::to_string_pretty(&cache)?;
     std::fs::write(cache_path, serialized)?;
 
