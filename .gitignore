@@ -1,4 +1,5 @@
 /target
 /**/target
 
-.cache.json
+.db.json
+.vscode

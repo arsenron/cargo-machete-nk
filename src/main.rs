@@ -4,7 +4,6 @@ use crate::search_unused::analyze_package;
 use anyhow::{bail, Context};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::ExitCode;
@@ -53,9 +52,9 @@ struct MacheteArgs {
     #[argh(option)]
     exclude: Vec<PathBuf>,
 
-    /// preserve cache for manifest files that have not been changed.
+    /// persist file db for manifest files that have not been changed.
     #[argh(option)]
-    cache_path: Option<PathBuf>,
+    db_path: Option<PathBuf>,
 }
 
 /// Runs `cargo-machete-nk`.
@@ -64,7 +63,7 @@ fn run_machete() -> anyhow::Result<bool> {
     pretty_env_logger::init();
 
     let args = init_args()?;
-    let mut cache = init_cache(&args);
+    let mut db = init_db(&args);
 
     let manifest_path_entries: Vec<PathBuf> = args
         .paths
@@ -76,18 +75,24 @@ fn run_machete() -> anyhow::Result<bool> {
         })
         .collect();
 
-    for path in manifest_path_entries {
-        let current_checksum = checksum(&path);
-        if let Some(cached_entry) = cache.records.get_mut(&path) {
-            if cached_entry.checksum != current_checksum {
-                *cached_entry = CargoDep {
+    for cargo_toml_path in manifest_path_entries {
+        if let Some(cargo_dep) = db.records.get_mut(&cargo_toml_path) {
+            let current_checksum = checksum(&cargo_toml_path)?;
+            if cargo_dep.checksum != current_checksum {
+                *cargo_dep = CargoDep {
                     checksum: current_checksum,
                     deps: None,
                 }
             }
         } else {
-            cache.records.insert(
-                path,
+            // Caculate checksum only if `db_path` is provided
+            let current_checksum = if args.db_path.is_some() {
+                checksum(&cargo_toml_path)?
+            } else {
+                String::new()
+            };
+            db.records.insert(
+                cargo_toml_path,
                 CargoDep {
                     checksum: current_checksum,
                     deps: None,
@@ -96,30 +101,31 @@ fn run_machete() -> anyhow::Result<bool> {
         }
     }
 
-    log::debug!("Cache after checksum checks = {:#?}", cache);
-    let unchecked_packages = cache
+    log::debug!("Db after checksum checks = {:#?}", db);
+    let unchecked_packages = db
         .records
         .iter()
         .filter_map(|(path, dep)| dep.deps.is_none().then_some(path.to_owned()))
         .collect();
-    let (to_cache_sender, analyzed_deps) = mpsc::channel();
-    let cache_thread = std::thread::spawn(move || {
+    log::debug!("Packages to check - {:?}", unchecked_packages);
+    let (to_db_sender, analyzed_deps) = mpsc::channel();
+    let db_thread = std::thread::spawn(move || {
         while let Ok((path, deps)) = analyzed_deps.recv() {
-            let cache_entry = cache.records.get_mut(&path).expect("Infallible");
-            cache_entry.deps = Some(deps);
+            let cargo_dep = db.records.get_mut(&path).expect("Infallible");
+            cargo_dep.deps = Some(deps);
         }
-        cache
+        db
     });
 
-    analyze_packages(unchecked_packages, args.with_metadata, to_cache_sender);
+    analyze_packages(unchecked_packages, args.with_metadata, to_db_sender);
 
-    let mut cache = cache_thread.join().unwrap();
-    log::debug!("Cache after all the logic ran = {:#?}", cache);
+    let mut db = db_thread.join().unwrap();
+    log::debug!("Db after all the logic ran = {:#?}", db);
 
     let mut has_unused_dependencies = false;
     let mut has_ignored_used = false;
     let mut has_unused_dependencies_warning_shown = false;
-    for (path, cargo_dep) in &mut cache.records {
+    for (path, cargo_dep) in &mut db.records {
         let Some(deps) = &mut cargo_dep.deps else {
             continue;
         };
@@ -147,7 +153,7 @@ fn run_machete() -> anyhow::Result<bool> {
                 remove_dependencies(&fs::read_to_string(path)?, &deps.unused, &deps.ignored_used)?;
             fs::write(path, fixed).expect("Cargo.toml write error");
             // Save new checksum after fix and clear unused deps
-            let new_checksum = checksum(path);
+            let new_checksum = checksum(path)?;
             cargo_dep.checksum = new_checksum;
             deps.unused = Vec::new();
             deps.ignored_used = Vec::new();
@@ -190,10 +196,10 @@ fn run_machete() -> anyhow::Result<bool> {
         }
     }
 
-    // save cache
-    if let Some(cache_path) = args.cache_path {
-        if let Err(e) = persist_cache(cache, cache_path) {
-            eprintln!("Could not persist cache due to - {e:?}");
+    // persist db
+    if let Some(db_path) = args.db_path {
+        if let Err(e) = persist_db(db, db_path) {
+            eprintln!("Could not persist db due to - {e:?}");
         }
     }
 
@@ -235,25 +241,25 @@ fn init_args() -> anyhow::Result<MacheteArgs> {
     Ok(args)
 }
 
-fn init_cache(args: &MacheteArgs) -> Cache {
-    let cache_serialized = {
-        if let Some(cache_path) = &args.cache_path {
-            std::fs::read_to_string(cache_path).unwrap_or_default()
+fn init_db(args: &MacheteArgs) -> Db {
+    let db_serialized = {
+        if let Some(db_path) = &args.db_path {
+            std::fs::read_to_string(db_path).unwrap_or_default()
         } else {
             String::new()
         }
     };
 
-    // Stick with default if either something is wrong with the cache or it is empty
-    let mut cache: Cache =
-        serde_json::from_str(&cache_serialized).unwrap_or(Cache::with_paths(args.paths.clone()));
-    if cache.paths != args.paths {
-        // Clear cache for different paths
-        // todo: we can cache per paths (make combination of paths as keys to cache.)
-        cache = Cache::with_paths(args.paths.clone())
+    // Stick with default if either something is wrong with the db or it is empty
+    let mut db: Db =
+        serde_json::from_str(&db_serialized).unwrap_or(Db::with_paths(args.paths.clone()));
+    if db.paths != args.paths {
+        // Clear db for different paths
+        // todo: we can persist dbpersist db per paths (make combination of paths as keys)
+        db = Db::with_paths(args.paths.clone())
     }
-    log::debug!("Initial Cache = {:#?}", cache);
-    cache
+    log::debug!("Initial db = {:#?}", db);
+    db
 }
 
 fn is_hidden(entry: &DirEntry) -> bool {
@@ -314,18 +320,43 @@ fn running_as_cargo_cmd() -> bool {
     std::env::var("CARGO").is_ok() && std::env::var("CARGO_PKG_NAME").is_err()
 }
 
-fn checksum(file: &Path) -> String {
-    let bytes = fs::read(file).unwrap();
-    hex::encode(Sha256::digest(bytes))
+/// Checksums recursively source files in a dir containing Cargo toml file
+/// and the toml file itself
+fn checksum(cargo_toml_path: &Path) -> anyhow::Result<String> {
+    let cargo_dir = cargo_toml_path
+        .parent()
+        .expect("path not to be empty or a root");
+    let src_dir = cargo_dir.join("src");
+    // todo: this should be handled another way (Alter return type for example).
+    //  These are probably virtual manifests (no package table) and we can skip it.
+    if !src_dir.exists() {
+        return Ok(String::new());
+    }
+    let src_tree = merkle_hash::MerkleTree::builder(
+        src_dir.to_str().expect("Only UTF-8 systems are supported"),
+    )
+    .algorithm(merkle_hash::Algorithm::Blake3)
+    .hash_names(true)
+    .build()?;
+
+    let toml_contents = fs::read(cargo_toml_path).unwrap();
+    let toml_hashed = merkle_hash::blake3::hash(&toml_contents);
+
+    let mut final_checksum = src_tree.root.item.hash;
+    final_checksum.extend(&toml_hashed.as_bytes()[..]);
+
+    Ok(hex::encode(
+        merkle_hash::blake3::hash(&final_checksum).as_bytes(),
+    ))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Cache {
+pub struct Db {
     records: BTreeMap<PathBuf, CargoDep>,
     paths: Vec<PathBuf>,
 }
 
-impl Cache {
+impl Db {
     pub fn with_paths(paths: Vec<PathBuf>) -> Self {
         Self {
             records: Default::default(),
@@ -347,10 +378,10 @@ pub struct Deps {
     pub package_name: String,
 }
 
-fn persist_cache(mut cache: Cache, cache_path: PathBuf) -> anyhow::Result<()> {
-    cache.paths.sort();
-    let serialized = serde_json::to_string_pretty(&cache)?;
-    std::fs::write(cache_path, serialized)?;
+fn persist_db(mut db: Db, db_path: PathBuf) -> anyhow::Result<()> {
+    db.paths.sort();
+    let serialized = serde_json::to_string_pretty(&db)?;
+    std::fs::write(db_path, serialized)?;
 
     Ok(())
 }
@@ -358,10 +389,10 @@ fn persist_cache(mut cache: Cache, cache_path: PathBuf) -> anyhow::Result<()> {
 fn analyze_packages(
     entries: Vec<PathBuf>,
     with_metadata: bool,
-    to_cache: mpsc::Sender<(PathBuf, Deps)>,
+    to_db: mpsc::Sender<(PathBuf, Deps)>,
 ) {
     entries.par_iter().for_each(|manifest_path| {
-        match analyze_package(manifest_path, with_metadata, to_cache.clone()) {
+        match analyze_package(manifest_path, with_metadata, to_db.clone()) {
             Ok(None) => {
                 log::info!(
                     "{} is a virtual manifest for a workspace",

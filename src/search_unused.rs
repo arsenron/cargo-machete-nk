@@ -663,7 +663,7 @@ fn test_just_unused_with_manifest() {
     check_analysis(
         "./integration-tests/workspace-package/program/Cargo.toml",
         |analysis| {
-            assert_eq!(analysis.unused, &["log".to_string()]);
+            assert_eq!(analysis.unused, &["hex".to_string(), "log".to_string()]);
         },
     );
 }

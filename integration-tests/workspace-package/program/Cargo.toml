@@ -7,3 +7,4 @@ description.workspace = true
 
 [dependencies]
 log.workspace = true
+hex = "0.4.3"

@@ -1,3 +1,7 @@
+# 0.9.0
+
+- Breaking: Rename `--cache-path` to `--db-path` 
+
 # 0.8.0
 
 - Breaking: when ignore used is found, the program finishes with exit code 1
