@@ -1,4 +1,5 @@
 use cargo_metadata::{CargoOpt, DependencyKind};
+use cargo_util_schemas::core::PackageIdSpec;
 use grep::{
     matcher::LineTerminator,
     regex::{RegexMatcher, RegexMatcherBuilder},
@@ -341,12 +342,10 @@ pub(crate) fn analyze_package(
             .nodes
             .iter()
             .find(|node| {
-                // e.g. "aa 0.1.0 (path+file:///tmp/aa)"
-                node.id
-                    .repr
-                    .split(' ')
-                    .next() // e.g. "aa"
-                    .map_or(false, |node_package_name| node_package_name == package_name)
+                let Ok(spec) = PackageIdSpec::parse(&node.id.repr) else {
+                    return false;
+                };
+                spec.name() == package_name
             })
             .expect("the current package must be in the dependency graph")
             .deps
