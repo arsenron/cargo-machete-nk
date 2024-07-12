@@ -75,14 +75,14 @@ fn run_machete() -> anyhow::Result<bool> {
         })
         .collect();
 
+    let unique_run_id = uuid::Uuid::new_v4().to_string();
     for cargo_toml_path in manifest_path_entries {
         if let Some(cargo_dep) = db.records.get_mut(&cargo_toml_path) {
+            (*cargo_dep).unique_run_id = unique_run_id.clone();
             let current_checksum = checksum(&cargo_toml_path)?;
             if cargo_dep.checksum != current_checksum {
-                *cargo_dep = CargoDep {
-                    checksum: current_checksum,
-                    deps: None,
-                }
+                (*cargo_dep).checksum = current_checksum;
+                (*cargo_dep).deps = None;
             }
         } else {
             // Caculate checksum only if `db_path` is provided
@@ -96,10 +96,14 @@ fn run_machete() -> anyhow::Result<bool> {
                 CargoDep {
                     checksum: current_checksum,
                     deps: None,
+                    unique_run_id: unique_run_id.clone(),
                 },
             );
         }
     }
+
+    // Invalidate cache
+    db.records.retain(|_, v| v.unique_run_id == unique_run_id);
 
     log::debug!("Db after checksum checks = {:#?}", db);
     let unchecked_packages = db
@@ -369,6 +373,8 @@ impl Db {
 pub struct CargoDep {
     pub checksum: String,
     pub deps: Option<Deps>,
+    /// Used to invalidate cache
+    pub unique_run_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
